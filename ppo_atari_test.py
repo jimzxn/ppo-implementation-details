@@ -55,7 +55,7 @@ def parse_args():
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gae", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="Use GAE for advantage computation")
+        help="Use GAE for advantage computation") 
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
@@ -227,9 +227,11 @@ if __name__ == "__main__":
                     writer.add_scalar("charts/episodic_return", item["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", item["episode"]["l"], global_step)
                     break
-
+            #print("shape of values",values.shape) (args.num_envs , args.num_steps)
         # bootstrap value if not done
         with torch.no_grad():
+            #using plan two
+            #final_value = torch.full(rewards.shape,)
             next_value = agent.get_value(next_obs).reshape(1, -1)
             if args.gae:
                 advantages = torch.zeros_like(rewards).to(device)
@@ -245,6 +247,7 @@ if __name__ == "__main__":
                     advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
                 returns = advantages + values
             else:
+                #using plan two
                 returns = torch.zeros_like(rewards).to(device)
                 for t in reversed(range(args.num_steps)):
                     if t == args.num_steps - 1:
@@ -254,8 +257,8 @@ if __name__ == "__main__":
                         nextnonterminal = 1.0 - dones[t + 1]
                         next_return = returns[t + 1]
                     returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
-                advantages = returns - values
-
+                advantages = returns - values[-1]
+            
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)

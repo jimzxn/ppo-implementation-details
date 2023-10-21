@@ -42,7 +42,8 @@ Train agents with experiment tracking:
 ```
 poetry run python ppo_atari.py --track --capture-video
 ```
-
+# for my test
+poetry run python ppo_atari_test.py --total-timesteps 100000 --cuda --num-envs 16 --num-minibatches 8 --gae False --capture-video True --num-steps 64
 
 ### Pybullet
 Install dependencies:
