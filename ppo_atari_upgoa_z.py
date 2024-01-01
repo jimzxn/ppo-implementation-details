@@ -193,8 +193,8 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset()).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
+    cur_obs = torch.Tensor(envs.reset()).to(device)
+    cur_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
     cum_reward=0
 
@@ -206,21 +206,27 @@ if __name__ == "__main__":
             optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
+            
+            # 每一步存储，当前cur_obs，action，cur_done，reward，value
+
             global_step += 1 * args.num_envs
-            obs[step] = next_obs
-            dones[step] = next_done
+            obs[step] = cur_obs
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value = agent.get_action_and_value(cur_obs)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, done, info = envs.step(action.cpu().numpy())
+            next_obs, reward, cur_done, info = envs.step(action.cpu().numpy())
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
+
+            # zjj
+            next_obs, cur_done = torch.Tensor(next_obs).to(device), torch.Tensor(cur_done).to(device)
+            dones[step] = cur_done 
+            cur_obs = next_obs
 
             for item in info:
                 if "episode" in item.keys():
@@ -228,44 +234,91 @@ if __name__ == "__main__":
                     writer.add_scalar("charts/episodic_return", item["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", item["episode"]["l"], global_step)
                     break
+            
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(cur_obs).reshape(1, -1)
             if args.gae:
-                advantages = torch.zeros_like(rewards).to(device)
+                #change into upgoa
+
+                GAE_advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
                 for t in reversed(range(args.num_steps)):
+                    nonterminal = 1.0 - dones[t]
                     if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
-                        nextvalues = next_value
+                        nextvalues = next_value # 最后一个cur_obs得出
                     else:
-                        nextnonterminal = 1.0 - dones[t + 1]
                         nextvalues = values[t + 1]
-                    delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                    advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                returns = advantages + values
+
+                    delta = rewards[t] + args.gamma * nextvalues * nonterminal - values[t]
+                    GAE_advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nonterminal * lastgaelam
+                GAE_returns = GAE_advantages + values
+
+                #upgo with gae
+                value_t_plus_1 = torch.cat([values[1:], next_value], dim=0) # 多了一个next_value，可以算t0~tn 的adv
+                next_Q = value_t_plus_1[-1]  # value_t_plus_1，next_Q 的时间是(没有t0) t1~tn
+                #print("value_t_plus_1",value_t_plus_1.size())
+                #print("GAE_returns",GAE_returns.size())
+                target_value = [next_value]
+                old_value = [next_value]
+                zero_base = torch.zeros_like(target_value[-1])
+                for t in reversed(range(args.num_steps)): # 算t0~tn 的adv
+                    nonterminal = 1.0 - dones[t]
+                    nextvalues = value_t_plus_1[t] # 最后一个cur_obs得出
+
+                    upgo_mask = torch.gt(next_Q, nextvalues)
+                    upgo_bootstrapping = upgo_mask * target_value[-1]
+                    v_bootstrapping = ~upgo_mask * value_t_plus_1[t]
+                    bootstrapping = v_bootstrapping + upgo_bootstrapping
+
+                    upgo_adv = rewards[t] + args.gamma *nonterminal* bootstrapping - values[t]
+                
+                    adjust_mask = torch.gt(GAE_advantages[t] * upgo_adv, zero_base)
+                    adjust_mask = torch.where(adjust_mask, 1., 0.99)
+                    
+                    upgo_adv = upgo_adv * adjust_mask
+                    #print("UPGO_returns",returns.size())   
+                    target_value.append(upgo_adv)
+                    old_value.append(values[t])
+                    next_Q = rewards[t] + value_t_plus_1[t]
+
+                target_value.reverse()
+                old_value.reverse()
+                # Remove bootstrap value from end of target_values list
+                
+                #print("target_value",np.size(target_value))  
+                target_value = torch.stack(target_value[:-1], dim=0)
+                target_value = torch.squeeze(target_value,1)
+                #print("target_value after",target_value.size())  
+                old_value = torch.stack(old_value[:-1], dim=0)
+                # zjj
+                advantages = target_value  # adv  # target_value - value
+                returns = target_value + values  # adv + value
+                #print("UPGO_returns",returns.size())   
             else:
                 returns = torch.zeros_like(rewards).to(device)
                 for t in reversed(range(args.num_steps)):
+                    nonterminal = 1.0 - dones[t]
                     if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
                         next_return = next_value
                     else:
-                        nextnonterminal = 1.0 - dones[t + 1]
                         next_return = returns[t + 1]
-                    returns[t] = rewards[t] + args.gamma * nextnonterminal * next_return
+                    returns[t] = rewards[t] + args.gamma * nonterminal * next_return
                 advantages = returns - values
 
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
+        a_advantages = advantages.reshape(-1)#upgo advantage
+        b_advantages = GAE_advantages.reshape(-1)
+        #print("return",returns.size())
+        b_returns = GAE_returns.reshape(-1)
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
+        #12
         b_inds = np.arange(args.batch_size)
         clipfracs = []
         for epoch in range(args.update_epochs):
@@ -283,15 +336,26 @@ if __name__ == "__main__":
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+                
+                ma_advantages = a_advantages[mb_inds]
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                    ma_advantages = (ma_advantages - ma_advantages.mean()) / (ma_advantages.std() + 1e-8)
 
                 # Policy loss
+                
+                apg_loss1 = -ma_advantages * ratio
+                apg_loss2 = -ma_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                apg_loss = torch.max(apg_loss1, apg_loss2).mean()
+
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                #mixing
+
 
                 # Value loss
                 newvalue = newvalue.view(-1)
@@ -309,8 +373,8 @@ if __name__ == "__main__":
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
-
+                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef + apg_loss*0.1
+                
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
@@ -321,9 +385,10 @@ if __name__ == "__main__":
                     break
 
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        #print("size of ",np.size(y_pred),np.size(y_true))
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-        #cum sum reward
+
         b_rewards = rewards.sum()
         writer.add_scalar("losses/Cum_reward", b_rewards, global_step)
         # TRY NOT TO MODIFY: record rewards for plotting purposes

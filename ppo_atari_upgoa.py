@@ -233,18 +233,64 @@ if __name__ == "__main__":
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(1, -1)
             if args.gae:
-                advantages = torch.zeros_like(rewards).to(device)
+                #change into upgoa
+
+                GAE_advantages = torch.zeros_like(rewards).to(device)
                 lastgaelam = 0
                 for t in reversed(range(args.num_steps)):
                     if t == args.num_steps - 1:
-                        nextnonterminal = 1.0 - next_done
+                        nextnonterminal = 1.0 - next_done#bootstrap
                         nextvalues = next_value
                     else:
                         nextnonterminal = 1.0 - dones[t + 1]
                         nextvalues = values[t + 1]
                     delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                    advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                returns = advantages + values
+                    GAE_advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
+                GAE_returns = GAE_advantages + values
+
+                #upgo with gae
+                value_t_plus_1 = torch.cat([values[1:], torch.unsqueeze(next_done, 0)], dim=0)
+                target_value = [next_done]
+                old_value = [next_done]
+
+                next_Q = value_t_plus_1[-1]
+                zero_base = torch.zeros_like(target_value[-1])
+
+                for t in reversed(range(args.num_steps-1)):
+                    if t == args.num_steps - 1:
+                        nextnonterminal = 1.0 - next_done#bootstrap
+                        nextvalues = next_value
+                    else:
+                        nextnonterminal = 1.0 - dones[t + 1]
+                        nextvalues = values[t + 1]
+                    upgo_mask = torch.gt(next_Q, value_t_plus_1[t])
+                    upgo_bootstrapping = upgo_mask * target_value[-1]
+                    v_bootstrapping = ~upgo_mask * value_t_plus_1[t]
+                    bootstrapping = v_bootstrapping + upgo_bootstrapping
+
+                    upgo_adv = rewards[t] + args.gamma *nextnonterminal* bootstrapping - values[t]
+                
+                    adjust_mask = torch.gt(GAE_advantages[t] * upgo_adv, zero_base)
+                    adjust_mask = torch.where(adjust_mask, 1., 0.99)
+                    
+                    upgo_adv = upgo_adv * adjust_mask
+
+                    target_value.append(upgo_adv)
+                    old_value.append(values[t])
+                    next_Q = rewards[t] + value_t_plus_1[t]
+                target_value.reverse()
+                old_value.reverse()
+                # Remove bootstrap value from end of target_values list
+                target_value = torch.stack(target_value[:-1], dim=0)
+                old_value = torch.stack(old_value[:-1], dim=0)
+                # zjj
+                advantages = target_value  # adv  # target_value - value
+                returns = target_value + values[:-1]  # adv + value
+                   
+
+
+
+
             else:
                 returns = torch.zeros_like(rewards).to(device)
                 for t in reversed(range(args.num_steps)):
@@ -266,12 +312,13 @@ if __name__ == "__main__":
         b_values = values.reshape(-1)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
+        #12
+        b_inds = np.arange(args.batch_size-32)
         clipfracs = []
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
+            for start in range(0, args.batch_size-32, args.minibatch_size-1):
+                end = start + args.minibatch_size-1
                 mb_inds = b_inds[start:end]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions.long()[mb_inds])
@@ -320,10 +367,10 @@ if __name__ == "__main__":
                 if approx_kl > args.target_kl:
                     break
 
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        y_pred, y_true = b_values[:-32].cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-        #cum sum reward
+
         b_rewards = rewards.sum()
         writer.add_scalar("losses/Cum_reward", b_rewards, global_step)
         # TRY NOT TO MODIFY: record rewards for plotting purposes
